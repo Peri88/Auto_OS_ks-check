@@ -1,0 +1,40 @@
+Write-Output "Stopping Veritas services..." ## 서비스 중지
+
+Stop-Service -Name "NetBackup Client Service" -Force -ErrorAction SilentlyContinue ## 클라이언트 서비스 중지
+Stop-Service -Name "Veritas Private Branch Exchange" -Force -ErrorAction SilentlyContinue ## 프라이빗 브랜치 교환 서비스 중지
+Start-Sleep -Seconds 5 ## 5초 뒤 재시작
+
+Write-Output "Shutting down NetBackup platform..."  ## NetBackup 플랫폼 종료
+
+Set-Location "C:\Veritas\NetBackup\bin"   ## NetBackup 설치 경로로 이동
+.\bpdown.exe -f -v
+Start-Sleep -Seconds 3 ## 3초 뒤 재시작
+
+Write-Output "Starting NetBackup platform..." ## NetBackup 플랫폼 시작  
+
+.\bpup.exe -f -v
+
+Write-Output "Starting Veritas services..." ## 서비스 시작
+
+Start-Service -Name "Veritas Private Branch Exchange"       ## 프라이빗 브랜치 교환 서비스 시작
+Start-Sleep -Seconds 3 ## 3초 뒤 재시작
+Start-Service -Name "NetBackup Client Service"     ## 클라이언트 서비스 시작
+
+Write-Output "Veritas services restarted successfully." ## 서비스 재시작 완료
+
+
+## Veritas(Backup)/Solution_Restart_Scripts
+
+## Veritas 서비스 재시작 스크립트
+## 작성자: [Owen_K]
+## 작성일: 2024-06-26
+## 설명: 이 스크립트는 Veritas NetBackup 서비스를 안전하게 중지하고
+##       NetBackup 플랫폼을 재시작한 후, 서비스를 다시 시작합니다.
+##       서비스 중지 및 시작 시 오류가 발생해도 무시하고 진행합니다.
+##       각 단계 사이에 적절한 대기 시간을 두어 안정성을 높입니다.
+##       이 스크립트는 관리자 권한으로 실행되어야 합니다.
+##       NetBackup 설치 경로는 기본 경로인 "C:\Veritas\NetBackup"으로 가정합니다.
+##       필요에 따라 경로를 변경할 수 있습니다.
+##       이 스크립트는 PowerShell 환경에서 실행되어야 합니다.
+##       스크립트 실행 후 로그를 확인하여 모든 서비스가 정상적으로 재시작되었는지 확인하는 것이 좋습니다.
+

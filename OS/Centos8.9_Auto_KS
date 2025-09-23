@@ -1,0 +1,118 @@
+# ======================== 기본 ========================
+cdrom
+lang ko_KR.UTF-8
+keyboard us
+timezone Asia/Seoul --utc
+eula --agreed
+firstboot --disable
+selinux --disabled
+firewall --disabled
+reboot
+
+# 설치 중 네트워크: DHCP (설치 후 수동 고정 IP 적용)
+network --bootproto=dhcp --device=link --activate
+network --hostname=changeme.local
+
+# root 계정
+rootpw --plaintext Qhdks100%
+
+# ======================== 파티셔닝 ========================
+zerombr
+clearpart --all --initlabel
+part /boot     --fstype=xfs --size=2048
+part /boot/efi --fstype=efi --size=1024
+part swap      --fstype=swap --size=262144
+part /         --fstype=xfs --size=307200
+part /var      --fstype=xfs --size=40960
+part /tmp      --fstype=xfs --size=10240 --grow
+
+bootloader --timeout=1
+
+# ======================== 패키지 ========================
+%packages
+# Server with GUI (Mandatory + Optional)
+@Common NetworkManager submodules
+@Container Management
+@Core
+@Fonts
+@GNOME
+@Guest Desktop Agents
+@Hardware Monitoring Utilities
+@Hardware Support
+@Headless Management
+@Input Methods
+@Internet Browser
+@Multimedia
+@Printing Client
+@Server product core
+@Standard
+@base-x
+
+@Basic Web Server
+@DNS Name Server
+@Debugging Tools
+@FTP Server
+@File and Storage Server
+@Guest Agents
+@Infiniband Support
+@Mail Server
+@Network File System Client
+@Network Servers
+@Performance Tools
+@Remote Desktop Clients
+@Remote Management for Linux
+@Virtualization Client
+@Virtualization Hypervisor
+@Virtualization Tools
+@Windows File Server
+%end
+
+# ======================== 설치 후 작업 ========================
+
+# (1) nochroot: ISO → /opt/extras 복사
+%post --nochroot --log=/mnt/sysimage/root/ks-nochroot.log
+mkdir -p /mnt/sysimage/opt/extras
+if [ -d /run/install/repo/extras ]; then
+  cp -av /run/install/repo/extras/. /mnt/sysimage/opt/extras/
+fi
+%end
+
+# (2) chroot: 정책/스크립트/패치/Zabbix
+%post --log=/root/ks-post.log
+# 기본 정책
+systemctl disable firewalld || true
+systemctl mask firewalld || true
+sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+systemctl set-default graphical.target || true
+systemctl enable gdm || true
+
+# /opt/extras/sbin → /usr/local/sbin 배치
+if [ -d /opt/extras/sbin ]; then
+  mkdir -p /usr/local/sbin
+  cp -a /opt/extras/sbin/. /usr/local/sbin/
+  chmod 0755 /usr/local/sbin/os-post-*.sh
+fi
+
+# EPEL 설치 및 비활성화
+if [ -f /opt/extras/rpms/epel-release-latest-8.noarch.rpm ]; then
+  rpm -Uvh --force /opt/extras/rpms/epel-release-latest-8.noarch.rpm || true
+  sed -i 's/^enabled=.*/enabled=0/' /etc/yum.repos.d/epel*.repo || true
+fi
+
+# patch 스크립트(있으면) 실행 로그만 남김
+if [ -f /opt/extras/patch_rocky8_sp.txt ]; then
+  chmod +x /opt/extras/patch_rocky8_sp.txt || true
+  /opt/extras/patch_rocky8_sp.txt > /var/log/patch_rocky8_sp.log 2>&1 || true
+fi
+
+# Zabbix agent 설치(있으면) + 기본 설정
+if [ -f /opt/extras/rpms/zabbix-agent-4.0.20-1.el8.x86_64.rpm ]; then
+  rpm -Uvh --force /opt/extras/rpms/zabbix-agent-4.0.20-1.el8.x86_64.rpm || true
+  Z=/etc/zabbix/zabbix_agentd.conf
+  # 기존 Server/Hostname 라인 제거 후 1줄씩만 재기입
+  sed -ri -e '/^\s*#?\s*ServerActive\s*=.*/d' -e '/^\s*#?\s*Server\s*=.*/d' -e '/^\s*#?\s*Hostname\s*=.*/d' "$Z" || true
+  echo "Server=192.168.20.230" >> "$Z"
+  echo "Hostname=$(hostname)"  >> "$Z"
+  systemctl enable zabbix-agent || true
+fi
+%end

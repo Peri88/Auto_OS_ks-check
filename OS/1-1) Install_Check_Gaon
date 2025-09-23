@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# 경로: /usr/local/sbin/os-verify.sh
+# 목적: os-provision 적용 결과를 표로 검증(설정 정확성 위주)
+set -euo pipefail
+
+LOG="/var/log/os-verify.log"
+OUT="/var/log/os-verify-summary.txt"
+: >"$LOG"; : >"$OUT"
+
+NIS_DOMAIN="gaonchips"
+NIS_SERVER="gaonnis01"
+ZBX_SERVER="192.168.20.230"
+
+ts(){ date +'%F %T'; }
+note(){ printf "[%s] %s\n" "$(ts)" "$*" | tee -a "$LOG"; }
+
+# ── 표 유틸 (동아시아 폭 고려)
+cell(){ local s="${1:-}" w="${2:-60}"; python3 - "$s" "$w" <<'PY'
+import sys, unicodedata
+s=sys.argv[1]; w=int(sys.argv[2])
+def wcw(c):
+  return 0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in ('W','F') else 1)
+dw=sum(wcw(c) for c in s)
+if dw<=w: print(s+' '*(w-dw))
+else:
+  out=[]; tot=0
+  for ch in s:
+    cw=wcw(ch)
+    if tot+cw>max(w-1,0): break
+    out.append(ch); tot+=cw
+  print(''.join(out)+'…')
+PY
+}
+W1=28; W2=64; W3=8
+row(){ printf "%s | %s | %s\n" "$(cell "$1" $W1)" "$(cell "$2" $W2)" "$(cell "$3" $W3)" | tee -a "$OUT"; }
+hdr(){ printf "%s | %s | %s\n" "$(cell '항목' $W1)" "$(cell '실제값' $W2)" "$(cell '결과' $W3)" | tee -a "$OUT";
+       printf "%s-+-%s-+-%s\n" "$(printf '%0.s-' $(seq 1 $W1))" "$(printf '%0.s-' $(seq 1 $W2))" "$(printf '%0.s-' $(seq 1 $W3))" | tee -a "$OUT"; }
+
+note "== [COLLECT] =="
+
+# ── 수집(파이프 실패/grep 실패 무해화: awk/||true 사용)
+SEL=$(sestatus 2>/dev/null | awk -F: '/^SELinux status/{gsub(/^[ \t]+/,"",$2);print $2}' || true)
+FW_EN=$(systemctl show -p UnitFileState firewalld 2>/dev/null | awk -F= 'NR==1{print $2}' || true)
+FW_AC=$(systemctl show -p ActiveState   firewalld 2>/dev/null | awk -F= 'NR==1{print $2}' || true)
+
+AUTO=$(awk 'BEGIN{s=""} /^automount:/{print; exit} END{if(NR==0)print s}' /etc/nsswitch.conf 2>/dev/null || true)
+
+CONF="/etc/zabbix/zabbix_agentd.conf"
+ZBX_INST=$(rpm -q zabbix-agent >/dev/null 2>&1 && echo yes || echo no)
+ZBX_SRV=$(awk -F= '/^[[:space:]]*Server[[:space:]]*=/{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' "$CONF" 2>/dev/null || true)
+ZBX_HN=$(awk -F= '/^[[:space:]]*Hostname[[:space:]]*=/{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' "$CONF" 2>/dev/null || true)
+ZBX_EN=$(systemctl is-enabled zabbix-agent 2>/dev/null || echo disabled)
+ZBX_AC=$(systemctl is-active  zabbix-agent 2>/dev/null || echo inactive)
+ZBX_CT_SERVER=$(awk '/^[[:space:]]*Server[[:space:]]*=/{c++} END{print c+0}' "$CONF" 2>/dev/null || echo 0)
+ZBX_CT_HOSTNM=$(awk '/^[[:space:]]*Hostname[[:space:]]*=/{c++} END{print c+0}' "$CONF" 2>/dev/null || echo 0)
+
+HN_CUR=$(hostname)
+IPSHOW=$(ip -4 addr show 2>/dev/null | awk '/inet /{printf "%s dev %s ",$2,$7}' || true)
+
+YP_CONF=$(head -n1 /etc/yp.conf 2>/dev/null || echo "")
+HOST_HN_CT=$(awk -v h="$HN_CUR" '($1 ~ /^[0-9]+\./) && ($2==h){c++} END{print c+0}' /etc/hosts 2>/dev/null || echo 0)
+HOST_NIS1_CT=$(grep -c '\<gaonnis01\>' /etc/hosts 2>/dev/null || echo 0)
+HOST_NIS2_CT=$(grep -c '\<gaonnis02\>' /etc/hosts 2>/dev/null || echo 0)
+
+NOFILE_S=$(awk '/^\*\s+soft\s+nofile\s+[0-9]+$/{n=$4} END{print (n? n : "none")}' /etc/security/limits.conf 2>/dev/null || echo none)
+NOFILE_H=$(awk '/^\*\s+hard\s+nofile\s+[0-9]+$/{n=$4} END{print (n? n : "none")}' /etc/security/limits.conf 2>/dev/null || echo none)
+STACK_S=$(awk '/^\*\s+soft\s+stack\s+[0-9]+$/{n=$4} END{print (n? n : "none")}' /etc/security/limits.conf 2>/dev/null || echo none)
+SWAPN=$(sysctl -n vm.swappiness 2>/dev/null || echo "")
+VFSCP=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo "")
+
+note "== [REPORT] =="
+hdr
+row "SELinux"                 "${SEL:-unknown}"               "$([ "$SEL" = disabled ] && echo OK || echo FAIL)"
+row "firewalld enabled"       "${FW_EN:-NA}"                  "$([[ "$FW_EN" =~ (disabled|masked) ]] && echo OK || echo FAIL)"
+row "firewalld active"        "${FW_AC:-NA}"                  "$([[ "$FW_AC" =~ (inactive|NA) ]] && echo OK || echo FAIL)"
+row "nsswitch automount"      "${AUTO:-none}"                 "$([[ "${AUTO:-}" == 'automount:  nis file nis' ]] && echo OK || echo FAIL)"
+row "Hostname(실제)"          "${HN_CUR}"                     "$([ -n "${HN_CUR:-}" ] && echo OK || echo FAIL)"
+row "/etc/hosts: ${HN_CUR}"   "lines=${HOST_HN_CT}"           "$([ "${HOST_HN_CT:-0}" -ge 1 ] && echo OK || echo FAIL)"
+row "/etc/hosts: gaonnis01"   "lines=${HOST_NIS1_CT}"         "$([ "${HOST_NIS1_CT:-0}" -ge 1 ] && echo OK || echo FAIL)"
+row "/etc/hosts: gaonnis02"   "lines=${HOST_NIS2_CT}"         "$([ "${HOST_NIS2_CT:-0}" -ge 1 ] && echo OK || echo FAIL)"
+row "ip addr"                 "${IPSHOW:-none}"               "CHECK"
+row "/etc/yp.conf(1st)"       "${YP_CONF}"                    "$([[ "${YP_CONF}" == "domain ${NIS_DOMAIN} server ${NIS_SERVER}" ]] && echo OK || echo FAIL)"
+row "zabbix installed"        "${ZBX_INST}"                   "$([ "$ZBX_INST" = yes ] && echo OK || echo FAIL)"
+row "zabbix Server"           "${ZBX_SRV:-none}"              "$([ "${ZBX_SRV:-}" = "${ZBX_SERVER}" ] && echo OK || echo FAIL)"
+row "zabbix Hostname"         "${ZBX_HN:-none}"               "$([ -n "${ZBX_HN:-}" ] && [ "${ZBX_CT_HOSTNM:-0}" -eq 1 ] && echo OK || echo FAIL)"
+row "zabbix enabled/active"   "${ZBX_EN}/${ZBX_AC}"           "$([ "$ZBX_EN" = enabled ] && [ "$ZBX_AC" = active ] && echo OK || echo FAIL)"
+row "zabbix line counts"      "Server=${ZBX_CT_SERVER} Hostname=${ZBX_CT_HOSTNM}" "$([ "$ZBX_CT_SERVER" -eq 1 ] && [ "$ZBX_CT_HOSTNM" -eq 1 ] && echo OK || echo FAIL)"
+row "nofile soft/hard"        "${NOFILE_S}/${NOFILE_H}"       "$([ "${NOFILE_S:-}" = 65535 ] && [ "${NOFILE_H:-}" = 65535 ] && echo OK || echo FAIL)"
+row "stack soft"              "${STACK_S:-none}"              "$([ "${STACK_S:-}" = 65535 ] && echo OK || echo FAIL)"
+row "vm.swappiness"           "${SWAPN:-none}"                "$([ "${SWAPN:-}" = 10 ] && echo OK || echo FAIL)"
+row "vfs_cache_pressure"      "${VFSCP:-none}"                "$([ "${VFSCP:-}" = 10000 ] && echo OK || echo FAIL)"
+
+note "[완료] 요약: $OUT, 로그: $LOG"

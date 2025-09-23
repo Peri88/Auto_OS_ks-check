@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Proxmox VM Cleanup v6 (Stopped-age based, clean logging)
+# Deletes VMs that have been "stopped" for >= DAYS_IDLE days (this node only).
+# Stop-time detection order: journal (any unit) -> qemu log content -> qemu.log mtime -> conf mtime
+# PVE 7/8
+
+set -Eeuo pipefail
+
+########################
+# CONFIG
+DAYS_IDLE=7                 # stopped for >= N days
+DRY_RUN=false                # true: preview only; false: actually delete
+LOG_FILE="/var/log/vm_cleanup.log"
+STORAGE_TYPES=( "local" "local-lvm" )  # orphan 스캔 대상 스토리지 이름들
+JOURNAL_SINCE="2 years ago" # stop 이벤트 검색 범위
+########################
+
+log(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "missing cmd: $1"; exit 1; }; }
+
+# Return "EPOCH:journal" if journalctl shows a stop event for VMID
+last_stopped_epoch_from_journal() {
+  local vmid="${1:-}"; [[ -n "$vmid" ]] || return 1
+  local line epoch=""
+  # 전체 저널에서 VM <id>가 언급된 정지/종료 패턴 검색 (케이스 무시)
+  line=$(
+    journalctl -o short-unix --no-pager --since "$JOURNAL_SINCE" 2>/dev/null \
+      | grep -Ei "vm[[:space:]#]*${vmid}[^0-9]" \
+      | grep -Eoi "^[0-9]+\.[0-9]+.*(stopped|stop|shutdown|power[[:space:]]*off|poweroff|vm is down|qmp.*quit|qmp.*system_powerdown|kvm: exiting|kvm: terminating).*" \
+      | tail -n1
+  ) || true
+  [[ -z "$line" ]] && return 1
+  epoch=$(printf '%s\n' "$line" | awk -F'.' '{print $1}')
+  [[ -n "$epoch" ]] || return 1
+  printf '%s:journal\n' "$epoch"
+}
+
+# Return "EPOCH:qemu.log" if qemu log CONTENT contains stop markers
+last_stopped_epoch_from_qemulog_content() {
+  local vmid="${1:-}"; [[ -n "$vmid" ]] || return 1
+  local logf="/var/log/pve/qemu/${vmid}.log" epoch=""
+  [[ -f "$logf" ]] || return 1
+  if grep -Eqi "(stopped|stop|shutdown|power[[:space:]]*off|poweroff|qmp.*quit|qmp.*system_powerdown|kvm: exiting|kvm: terminating|vm is down)" "$logf"; then
+    epoch=$(stat -c %Y "$logf")
+    printf '%s:qemu.log\n' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
+# Fall back to qemu log mtime
+last_epoch_from_qemulog_mtime() {
+  local vmid="${1:-}"; [[ -n "$vmid" ]] || return 1
+  local logf="/var/log/pve/qemu/${vmid}.log"
+  [[ -f "$logf" ]] || return 1
+  printf '%s:qemu.mtime\n' "$(stat -c %Y "$logf")"
+}
+
+# Fall back to conf mtime
+last_epoch_from_conf_mtime() {
+  local vmid="${1:-}"; [[ -n "$vmid" ]] || return 1
+  local conf="/etc/pve/qemu-server/${vmid}.conf"
+  [[ -f "$conf" ]] || return 1
+  printf '%s:conf.mtime\n' "$(stat -c %Y "$conf")"
+}
+
+# Compute "stopped age" and source. Prints "AGE_DAYS:SOURCE"
+stopped_age_days_with_src() {
+  local vmid="${1:-}"; [[ -n "$vmid" ]] || { echo "99999:unknown"; return 0; }
+  local now epoch src pair
+  now=$(date +%s)
+
+  for fn in last_stopped_epoch_from_journal last_stopped_epoch_from_qemulog_content last_epoch_from_qemulog_mtime last_epoch_from_conf_mtime; do
+    if pair=$($fn "$vmid"); then
+      epoch="${pair%%:*}"
+      src="${pair##*:}"
+      local days=$(( (now - epoch) / 86400 ))
+      echo "${days}:${src}"
+      return 0
+    fi
+  done
+  echo "99999:unknown"
+}
+
+main() {
+  [[ $(id -u) -eq 0 ]] || { echo "Run as root"; exit 1; }
+  need qm; need pvesh; need awk; need sed; need grep; need journalctl
+  mkdir -p "$(dirname "$LOG_FILE")"
+  : > "$LOG_FILE"
+
+  local NODE; NODE=$(hostname)
+  log "===== VM cleanup start (criterion: stopped >= ${DAYS_IDLE}d, DRY_RUN=${DRY_RUN}, node=${NODE}) ====="
+
+  # 현재 노드의 VM 목록 (배열)
+  local -a VMIDS=()
+  while IFS= read -r id; do [[ -n "$id" ]] && VMIDS+=("$id"); done < <(qm list | awk 'NR>1 {print $1}')
+  (( ${#VMIDS[@]} == 0 )) && log "No VMs on node ${NODE}."
+
+  # --- VM 삭제 (stopped-age 기준) ---
+  local id status name conf res age src rc out
+  for id in "${VMIDS[@]}"; do
+    status=$(qm status "$id" 2>/dev/null | awk '{print $2}')
+    if [[ "${status:-unknown}" != "stopped" ]]; then
+      log "SKIP VMID=$id (status=${status:-unknown})"
+      continue
+    fi
+
+    conf="/etc/pve/qemu-server/${id}.conf"
+    [[ -f "$conf" ]] || { log "SKIP VMID=$id (config missing)"; continue; }
+
+    # 안전장치
+    if qm config "$id" 2>/dev/null | grep -q '^template:\s*1'; then log "SKIP VMID=$id (template)"; continue; fi
+    if qm config "$id" 2>/dev/null | grep -q '^protection:\s*1'; then log "SKIP VMID=$id (protection=1)"; continue; fi
+    if qm config "$id" 2>/dev/null | grep -q '^lock:'; then log "SKIP VMID=$id (locked)"; continue; fi
+
+    name=$(qm config "$id" 2>/dev/null | sed -n 's/^name:\s*//p')
+    res=$(stopped_age_days_with_src "$id")
+    age="${res%%:*}"; src="${res##*:}"
+
+    if (( age >= DAYS_IDLE )); then
+      log "TARGET VMID=$id (name='${name:-N/A}'), stopped ${age}d (src=${src})"
+      if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY RUN] qm destroy $id --purge"
+      else
+        set +e; out=$(qm destroy "$id" --purge 2>&1); rc=$?; set -e
+        [[ $rc -eq 0 ]] && log "DELETED VMID=$id" || log "FAILED to delete VMID=$id -> $out"
+      fi
+    else
+      log "SKIP VMID=$id (stopped ${age}d < ${DAYS_IDLE}d, src=${src})"
+    fi
+  done
+
+  # --- 삭제 이후: VM 목록 재수집 (orphan 스캔 시 방금 지운 VM 제외) ---
+  VMIDS=()
+  while IFS= read -r id; do [[ -n "$id" ]] && VMIDS+=("$id"); done < <(qm list | awk 'NR>1 {print $1}')
+
+  # --- Orphan 디스크 정리 (사용중 volid 집합과 대조) ---
+  log "--- orphan volumes scan ---"
+  local USED_VOLIDS ALL_VOLIDS VOL ST
+  USED_VOLIDS=$(
+    for id in "${VMIDS[@]}"; do
+      qm config "$id" 2>/dev/null \
+        | sed -n 's/^[a-z0-9]\+: \([^,]\+\).*/\1/p' \
+        | grep -E ':[^,]*vm-[0-9]+-disk-[0-9]+' || true
+    done | sort -u
+  )
+
+  for ST in "${STORAGE_TYPES[@]}"; do
+    if ! pvesh get /nodes/"$NODE"/storage/"$ST" >/dev/null 2>&1; then
+      log "SKIP storage '${ST}' (not accessible on ${NODE})"; continue
+    fi
+
+    ALL_VOLIDS=$(
+      pvesh get /nodes/"$NODE"/storage/"$ST"/content --output-format json \
+        | awk -F'"' '/"volid":/ {print $4}' \
+        | grep -E "^${ST}:[^,]*vm-[0-9]+-disk-[0-9]+$" || true
+    )
+
+    while IFS= read -r VOL; do
+      [[ -z "$VOL" ]] && continue
+      if grep -qx "$VOL" <<< "$USED_VOLIDS"; then
+        continue
+      fi
+      log "ORPHAN found: $VOL"
+      if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY RUN] pvesh delete /nodes/$NODE/storage/$ST/content --volid $VOL"
+      else
+        set +e; out=$(pvesh delete /nodes/"$NODE"/storage/"$ST"/content --volid "$VOL" 2>&1); rc=$?; set -e
+        [[ $rc -eq 0 ]] && log "ORPHAN deleted: $VOL" || log "ORPHAN delete failed: $VOL -> $out"
+      fi
+    done <<< "$ALL_VOLIDS"
+  done
+
+  log "===== VM cleanup done ====="
+}
+
+main "$@"
+

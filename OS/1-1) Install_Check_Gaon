@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# 경로: /usr/local/sbin/os-verify.sh
-# 목적: os-provision 적용 결과를 표로 검증(설정 정확성 위주)
 set -euo pipefail
 
 LOG="/var/log/os-verify.log"

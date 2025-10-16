@@ -1,6 +1,6 @@
 # ======================== 기본 ========================
 cdrom
-lang ko_KR.UTF-8
+lang en_US.UTF-8 ## OS언어 영어
 keyboard us
 timezone Asia/Seoul --utc
 eula --agreed

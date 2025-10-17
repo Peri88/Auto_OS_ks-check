@@ -72,8 +72,8 @@ bootloader --timeout=1
 # (1) nochroot: ISO → /opt/extras 복사
 %post --nochroot --log=/mnt/sysimage/root/ks-nochroot.log
 mkdir -p /mnt/sysimage/opt/extras
-if [ -d /run/install/repo/extras ]; then
-  cp -av /run/install/repo/extras/. /mnt/sysimage/opt/extras/
+if [ -d /run/install/repo/opt/extras ]; then
+  cp -av /run/install/repo/opt/extras/. /mnt/sysimage/opt/extras/
 fi
 %end
 

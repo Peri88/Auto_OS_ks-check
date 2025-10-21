@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── 고정값(질문 안 함)
+ZBX_SERVER="192.168.20.230"
+NIS_DOMAIN="gaonchips"
+NIS_SERVER="gaonnis01"
+DNS_PRIM="8.8.8.8"
+DNS_SEC="8.8.4.4"
+
+# 네트워크 준비 대기 파라미터(총 15초, 1초 간격) / SKIP_NET_WAIT=1 이면 대기 안 함
+NET_WAIT_MAX=${NET_WAIT_MAX:-15}
+NET_WAIT_INTERVAL=${NET_WAIT_INTERVAL:-1}
+SKIP_NET_WAIT=${SKIP_NET_WAIT:-0}
+
+LOG="/var/log/os-provision.log"
+SUM="/var/log/os-provision-summary.txt"
+: >"$LOG"; : >"$SUM"   # 셸 내장 ':' 사용(중요)
+
+# ── 헬퍼
+fails=(); SEC="INIT"
+ts(){ /usr/bin/date +'%F %T'; }
+note(){ /usr/bin/printf "[%s] %s\n" "$(ts)" "$*" | /usr/bin/tee -a "$LOG"; }
+sec(){ SEC="$1"; note "== [$SEC] =="; }
+run(){ "$@"; local rc=$?; if [ $rc -ne 0 ]; then
+  /usr/bin/printf "[%s][%s] FAIL rc=%d | %s\n" "$(ts)" "$SEC" "$rc" "$*" | /usr/bin/tee -a "$LOG"
+  fails+=("$SEC\t$(ts)\t$rc\t$*")
+fi; return 0; }
+cidr2mask(){ local p="$1"; local m=$(( (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF ));
+  /usr/bin/printf "%d.%d.%d.%d" $(((m>>24)&255)) $(((m>>16)&255)) $(((m>>8)&255)) $((m&255)); }
+re_escape(){ /usr/bin/printf '%s' "$1" | /usr/bin/sed 's/[.[\*^$()+?{}|\\/]/\\&/g'; }
+
+# 네트워크 준비 대기(링크/주소/라우팅/DNS/HTTP 중 일부 조건 만족까지 대기)
+wait_for_network(){
+  local deadline=$((SECONDS + NET_WAIT_MAX))
+  note "네트워크 준비 대기 시작(MAX=${NET_WAIT_MAX}s, interval=${NET_WAIT_INTERVAL}s)"
+  while (( SECONDS < deadline )); do
+    /usr/sbin/ip -4 addr show dev "$IFACE" | /usr/bin/grep -q 'inet ' && ip_ok=1 || ip_ok=0
+    if /usr/sbin/ip route | /usr/bin/grep -q "^default .* dev $IFACE" ; then rt_ok=1; else rt_ok=0; fi
+    if [ $rt_ok -eq 0 ]; then /usr/sbin/ip route replace default via "$GATEWAY" dev "$IFACE" 2>/dev/null || true; fi
+    /usr/bin/ping -c1 -W1 "$GATEWAY" >/dev/null 2>&1 && gw_ok=1 || gw_ok=0
+    /usr/bin/getent hosts mirrorlist.rockylinux.org >/dev/null 2>&1 && dns_ok=1 || dns_ok=0
+    http_ok=0
+    if /usr/bin/command -v curl >/dev/null 2>&1; then
+      /usr/bin/curl -m 2 -sI https://mirrorlist.rockylinux.org/ >/dev/null 2>&1 && http_ok=1 || http_ok=0
+    fi
+    if [ $ip_ok -eq 1 ] && /usr/sbin/ip route | /usr/bin/grep -q "^default .* dev $IFACE" && { [ $gw_ok -eq 1 ] || [ $dns_ok -eq 1 ] || [ $http_ok -eq 1 ]; }; then
+      note "네트워크 준비 완료(ip_ok=$ip_ok, gw_ok=$gw_ok, dns_ok=$dns_ok, http_ok=$http_ok)"
+      return 0
+    fi
+    /usr/bin/sleep "$NET_WAIT_INTERVAL"
+  done
+  note "네트워크 준비 확인 시간 초과(계속 진행). ip_ok=${ip_ok:-0} gw_ok=${gw_ok:-0} dns_ok=${dns_ok:-0} http_ok=${http_ok:-0}"
+  return 1
+}
+
+# ── 빨간칸 4개만 질문
+/bin/echo -n "호스트네임(예: gaon275): ";  read -r HN
+/bin/echo -n "NIC 이름(예: ens18 또는 ens1f1np1): "; read -r IFACE
+/bin/echo -n "IP 또는 CIDR(예: 192.168.19.135/24): "; read -r IP_OR_CIDR
+/bin/echo -n "GATEWAY(예: 192.168.19.1): "; read -r GATEWAY
+
+IPADDR=""; NETMASK=""
+if [[ "$IP_OR_CIDR" == */* ]]; then
+  IPADDR="${IP_OR_CIDR%/*}"; PREFIX="${IP_OR_CIDR#*/}"
+  [[ "$PREFIX" =~ ^([0-9]|[12][0-9]|3[0-2])$ ]] || { /bin/echo "CIDR prefix 오류: $PREFIX" | /usr/bin/tee -a "$LOG"; exit 2; }
+  NETMASK="$(cidr2mask "$PREFIX")"; note "CIDR 감지 → NETMASK=${NETMASK}"
+else
+  IPADDR="$IP_OR_CIDR"; /bin/echo -n "NETMASK(예: 255.255.255.0): "; read -r NETMASK
+fi
+for v in HN IFACE IPADDR NETMASK GATEWAY; do eval 'val="$'$v'"'; [ -n "${val// /}" ] || { /bin/echo "입력 누락: $v" | /usr/bin/tee -a "$LOG"; exit 2; }; done
+
+# ── DNS(/etc/resolv.conf) : 즉시 해석 가능 상태로
+sec "DNS(/etc/resolv.conf)"
+/usr/bin/grep -q "^nameserver ${DNS_PRIM}$" /etc/resolv.conf || /bin/echo "nameserver ${DNS_PRIM}" >> /etc/resolv.conf
+/usr/bin/grep -q "^nameserver ${DNS_SEC}$"  /etc/resolv.conf || /bin/echo "nameserver ${DNS_SEC}"  >> /etc/resolv.conf
+
+# ── NIC ifcfg 생성(경로 고정: /etc/sysconfig/network-scripts/)
+sec "NIC(/etc/sysconfig/network-scripts/ifcfg-${IFACE})"
+CFG="/etc/sysconfig/network-scripts/ifcfg-${IFACE}"
+UUID_LINE=""; [ -f "$CFG" ] && UUID_LINE="$(/usr/bin/grep -E '^UUID=' "$CFG" || true)"
+/usr/bin/cat > "$CFG" <<EOF
+TYPE=Ethernet
+PROXY_METHOD=none
+BROWSER_ONLY=no
+BOOTPROTO=static
+DEFROUTE=yes
+IPV4_FAILURE_FATAL=no
+#IPV6INIT=yes
+#IPV6_AUTOCONF=yes
+#IPV6_DEFROUTE=yes
+#IPV6_FAILURE_FATAL=no
+#IPV6_ADDR_GEN_MODE=eui64
+NAME=${IFACE}
+${UUID_LINE}
+DEVICE=${IFACE}
+ONBOOT=yes
+IPADDR=${IPADDR}
+NETMASK=${NETMASK}
+GATEWAY=${GATEWAY}
+DNS1=${DNS_PRIM}
+DNS2=${DNS_SEC}
+EOF
+
+run /usr/bin/nmcli connection reload
+CON=$(/usr/bin/nmcli -t -f NAME,DEVICE con show | /usr/bin/awk -F: -v d="$IFACE" '$2==d{print $1;exit}') || true
+if [ -z "${CON:-}" ]; then
+  run /usr/bin/nmcli connection load "$CFG"
+  CON="$IFACE"
+fi
+for N in $(/usr/bin/nmcli -t -f NAME,DEVICE con show --active | /usr/bin/awk -F: -v d="$IFACE" '$2==d{print $1}'); do
+  [ "$N" != "$CON" ] && run /usr/bin/nmcli connection down "$N"
+done
+run /usr/bin/nmcli device set "$IFACE" managed yes
+run /usr/bin/nmcli connection up "$CON" || true
+
+# 기본 라우트/이름해석 보조(필요 시)
+if ! /usr/sbin/ip route | /usr/bin/grep -q "^default .* dev $IFACE"; then
+  run /usr/sbin/ip route replace default via "$GATEWAY" dev "$IFACE"
+fi
+/usr/bin/grep -q "^nameserver ${DNS_PRIM}$" /etc/resolv.conf || /bin/echo "nameserver ${DNS_PRIM}" >> /etc/resolv.conf
+/usr/bin/grep -q "^nameserver ${DNS_SEC}$"  /etc/resolv.conf || /bin/echo "nameserver ${DNS_SEC}"  >> /etc/resolv.conf
+
+# ── 네트워크 준비 대기(토글 가능)
+if [ "$SKIP_NET_WAIT" = "1" ]; then
+  note "네트워크 준비 대기 SKIP(SKIP_NET_WAIT=1)"
+else
+  wait_for_network || note "네트워크 준비 확인 시간 초과(계속 진행)"
+fi
+
+# 최종 NIC 상태 로그
+/usr/sbin/ip -4 addr show dev "$IFACE" | /usr/bin/tee -a "$LOG" || true
+/usr/sbin/ip route | /usr/bin/tee -a "$LOG" || true
+
+# ── /etc/hosts 완전 치환(정확히 4줄 유지, 백업/여분 라인 없음)
+sec "/etc/hosts(치환)"
+/usr/bin/cat > /etc/hosts <<EOF
+127.0.0.1   localhost
+${IPADDR}   ${HN}
+192.168.21.111  gaonnis01
+192.168.21.112  gaonnis02
+EOF
+
+# ── /etc/sysconfig/network
+sec "/etc/sysconfig/network"
+/usr/bin/touch /etc/sysconfig/network
+/usr/bin/sed -ri "s|^HOSTNAME=.*$||" /etc/sysconfig/network
+/bin/echo "NETWORKING=yes" >> /etc/sysconfig/network
+/bin/echo "HOSTNAME=${HN}" >> /etc/sysconfig/network
+if /usr/bin/grep -q '^NISDOMAIN=' /etc/sysconfig/network ; then
+  /usr/bin/sed -ri "s|^NISDOMAIN=.*$|NISDOMAIN=${NIS_DOMAIN}|" /etc/sysconfig/network
+else
+  /bin/echo "NISDOMAIN=${NIS_DOMAIN}" >> /etc/sysconfig/network
+fi
+run /usr/bin/hostnamectl set-hostname "$HN"
+
+# ── EPEL/리포 준비(메인 ON) + powertools ON + 캐시 리프레시
+sec "EPEL/REPOS"
+/usr/bin/test -f /opt/extras/rpms/epel-release-latest-8.noarch.rpm \
+  && run /usr/bin/rpm -Uvh --force /opt/extras/rpms/epel-release-latest-8.noarch.rpm \
+  || run /usr/bin/dnf -y install epel-release || run /usr/bin/yum -y install epel-release
+run /usr/bin/dnf -y install dnf-plugins-core
+run /usr/bin/dnf config-manager --set-enabled epel powertools || true
+run /usr/bin/dnf clean all; /usr/bin/rm -rf /var/cache/dnf; run /usr/bin/dnf makecache --refresh
+
+# patch 스크립트(있으면) 실행
+sec "PATCH(optional)"
+if [ -f /opt/extras/patch_rocky8_sp.txt ]; then
+  run /bin/chmod +x /opt/extras/patch_rocky8_sp.txt
+  /opt/extras/patch_rocky8_sp.txt > /var/log/patch_rocky8_sp.log 2>&1 || true
+  /bin/echo $? > /var/log/patch_rocky8_sp.rc
+fi
+
+# ── 기본 패키지
+sec "PKGS(base)"
+PKGS=(libXScrnSaver 'libnsl*' 'libpng15*' libmng libtiff libstdc++ xorg-x11-server-Xvfb 'compat-openssl10*' 'libdb*' apr-util motif ntsysv python2 rpcbind autofs authselect)
+run /usr/bin/dnf -y install "${PKGS[@]}" --setopt=best=False --skip-broken || run /usr/bin/yum -y install "${PKGS[@]}"
+
+# ── Development Tools 그룹
+sec "GROUPINSTALL(Development Tools)"
+run /usr/bin/dnf -y groupinstall "Development Tools" || run /usr/bin/yum -y groupinstall "Development Tools" || run /usr/bin/yum -y groupinstall "@Development Tools"
+
+# ── NIS(설정은 항상 적용, 기동 실패 무시)
+sec "NIS"
+/usr/bin/printf 'domain %s server %s\n' "$NIS_DOMAIN" "$NIS_SERVER" > /etc/yp.conf
+/usr/bin/grep -Eq '^[[:space:]]*ypserver[[:space:]]+gaonnis02([[:space:]]|$)' /etc/yp.conf || /bin/echo 'ypserver gaonnis02' >> /etc/yp.conf
+if /usr/bin/grep -q '^automount:' /etc/nsswitch.conf; then
+  run /usr/bin/sed -ri --follow-symlinks 's/^automount:.*/automount:  nis file nis/' /etc/nsswitch.conf
+else
+  /bin/echo 'automount:  nis file nis' >> /etc/nsswitch.conf
+fi
+run /usr/bin/dnf -y install ypbind oddjob || run /usr/bin/yum -y install ypbind oddjob
+run /usr/bin/authselect select nis --force
+
+# 서비스 enable/now (시작 실패해도 계속)
+run /usr/bin/systemctl enable --now rpcbind || true
+run /usr/bin/systemctl enable --now ypbind || true
+run /usr/bin/systemctl enable --now nis-domainname || true
+run /usr/bin/systemctl enable --now oddjobd || true
+run /usr/bin/systemctl enable --now autofs || true
+
+# ── SELinux/Firewall
+sec "SELINUX/FIREWALL"
+[ -f /etc/selinux/config ] && run /usr/bin/sed -ri 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+run /usr/bin/systemctl stop firewalld
+run /usr/bin/systemctl disable firewalld || true
+run /usr/bin/systemctl mask firewalld || true
+
+# ── 라이브러리 심볼릭(/usr/lib64)
+sec "LIBS(/usr/lib64)"
+if [ -d /opt/extras/lib ]; then run /usr/bin/cp -an /opt/extras/lib/* /usr/lib64/; fi
+if [ -d /opt/extras/lib_rocky8.9 ]; then run /usr/bin/cp -an /opt/extras/lib_rocky8.9/* /usr/lib64/; fi
+[ -e /usr/lib64/libGLU.so.1.3.1 ]       && /usr/bin/ln -sfn libGLU.so.1.3.1       /usr/lib64/libGLU.so.1
+[ -e /usr/lib64/libicui18n.so.50.2 ]    && /usr/bin/ln -sfn libicui18n.so.50.2    /usr/lib64/libicui18n.so.50
+[ -e /usr/lib64/libpng15.so.15.13.0 ]   && /usr/bin/ln -sfn libpng15.so.15.13.0   /usr/lib64/libpng15.so.15
+[ -e /usr/lib64/libnsl-2.17.so ]        && /usr/bin/ln -sfn libnsl-2.17.so        /usr/lib64/libnsl.so.1
+[ -e /usr/lib64/libnsl.so.1 ]           && /usr/bin/ln -sfn libnsl.so.1           /usr/lib64/libnsl.so
+[ -e /usr/lib64/libicuuc.so.50.2 ]      && /usr/bin/ln -sfn libicuuc.so.50.2      /usr/lib64/libicuuc.so.50
+[ -e /usr/lib64/libaprutil-1.so.0.5.2 ] && /usr/bin/ln -sfn libaprutil-1.so.0.5.2 /usr/lib64/libaprutil-1.so.0
+# 요구사항 4개 정확히 적용(-Tfs)
+[ -e /usr/lib64/libapr-1.so.0.4.8 ]     && /usr/bin/ln -Tfs libapr-1.so.0.4.8     /usr/lib64/libapr-1.so.0
+[ -e /usr/lib64/libaprutil-1.so.0.5.2 ] && /usr/bin/ln -Tfs libaprutil-1.so.0.5.2 /usr/lib64/libaprutil-1.so.0
+[ -e /usr/lib64/libpng15.so.15.13.0 ]   && /usr/bin/ln -Tfs libpng15.so.15.13.0   /usr/lib64/libpng15.so.15
+[ -e /usr/lib64/libnsl-2.17.so ]        && /usr/bin/ln -Tfs libnsl-2.17.so        /usr/lib64/libnsl.so.1
+
+# ── limits/sysctl
+sec "LIMITS/SYSCTL"
+/usr/bin/grep -q '^\* soft nofile 65535$' /etc/security/limits.conf || /bin/echo "* soft nofile 65535" >> /etc/security/limits.conf
+/usr/bin/grep -q '^\* hard nofile 65535$' /etc/security/limits.conf || /bin/echo "* hard nofile 65535" >> /etc/security/limits.conf
+/usr/bin/grep -q '^\* soft stack 65535$'  /etc/security/limits.conf || /bin/echo "* soft stack 65535"  >> /etc/security/limits.conf
+/usr/bin/grep -q '^vm\.vfs_cache_pressure=10000$' /etc/sysctl.conf || /bin/echo "vm.vfs_cache_pressure=10000" >> /etc/sysctl.conf
+/usr/bin/grep -q '^vm\.swappiness\s*=\s*10$'      /etc/sysctl.conf || /bin/echo "vm.swappiness = 10"        >> /etc/sysctl.conf
+run /usr/sbin/sysctl -w vm.vfs_cache_pressure=10000
+run /usr/sbin/sysctl -w vm.swappiness=10
+
+# ── SSH KeepAlive
+sec "SSH(/etc/ssh/sshd_config)"
+run /usr/bin/sed -ri 's/^\s*#?\s*ClientAliveInterval\s+.*/ClientAliveInterval 600/' /etc/ssh/sshd_config
+run /usr/bin/sed -ri 's/^\s*#?\s*ClientAliveCountMax\s+.*/ClientAliveCountMax 10/'  /etc/ssh/sshd_config
+run /usr/bin/sed -ri 's/^\s*#?\s*TCPKeepAlive\s+.*/TCPKeepAlive yes/'               /etc/ssh/sshd_config
+run /usr/bin/systemctl restart sshd
+
+# ── CRON(root crontab) — 정확히 3줄만 존재(괄호 포함)
+sec "CRON(root crontab)"
+/usr/bin/install -d -m 1730 -o root -g root /var/spool/cron
+TMP_CRON="$(/usr/bin/mktemp)"; trap '/usr/bin/rm -f "$TMP_CRON"' RETURN
+/usr/bin/cat > "$TMP_CRON" <<'CRON'
+10 0 * * * ( sync ; echo 3 > /proc/sys/vm/drop_caches )
+0 1 * * * (/sbin/swapoff -a && /sbin/swapon -a)
+0 12 * * * ( sync ; echo 3 > /proc/sys/vm/drop_caches )
+CRON
+run /usr/bin/crontab -u root "$TMP_CRON"
+run /usr/bin/systemctl enable --now crond
+# 보장용(파일 직접배치)
+if ! /usr/bin/crontab -l 2>/dev/null | /usr/bin/grep -q '0 12 \* \* \*'; then
+  /usr/bin/install -m 0600 -o root -g root "$TMP_CRON" /var/spool/cron/root
+fi
+
+# ── Zabbix Agent(정확히 2줄 보장)
+sec "ZABBIX"
+ZBX="/opt/extras/rpms/zabbix-agent-4.0.20-1.el8.x86_64.rpm"
+[ -f "$ZBX" ] && run /usr/bin/yum -y localinstall "$ZBX" || run /usr/bin/dnf -y localinstall "$ZBX" || true
+if /usr/bin/rpm -q zabbix-agent >/dev/null 2>&1; then
+  CONF="/etc/zabbix/zabbix_agentd.conf"
+  /usr/bin/sed -ri -e '/^\s*#?\s*Server\s*=.*/d' -e '/^\s*#?\s*Hostname\s*=.*/d' "$CONF"
+  /usr/bin/printf "Server=%s\nHostname=%s\n" "$ZBX_SERVER" "$HN" >> "$CONF"
+  run /usr/bin/systemctl enable --now zabbix-agent
+fi
+
+# ── /usr/bin/python 심볼릭
+sec "PYTHON"
+if /usr/bin/command -v python2 >/dev/null 2>&1; then /usr/bin/ln -sfn /usr/bin/python2 /usr/bin/python
+elif /usr/bin/command -v python3 >/dev/null 2>&1; then /usr/bin/ln -sfn /usr/bin/python3 /usr/bin/python
+fi
+
+# ── 패키지 대량 설치(보강 루틴: 리포옵션 + best완화 + 자동 매핑)
+sec "PKGS-EXTRA(ensure)"
+EXTRA_PKGS=(
+  "ftp*" "system-config-users*" "ksh*" "redhat-lsb*" "redhat-lsb.i686*"
+  "gdm*" "gdm.i686*" "gdm-devel.i686*" "gdbm*" "gdbm.i686*" "gdbm-devel.i686*"
+  "glibc*" "glibc.i686*" "glibc-devel.i686*" "tcl*" "tcl.i686*" "tcl-devel.i686*"
+  "tk*" "tk.i686*" "tk-devel.i686*" "libXp*" "libXp.i686*" "libXp-devel.i686*"
+  "libXpm*" "libXpm.i686*" "libXpm-devel.i686*" "libXest-devel.i686*"
+  "libXmu*" "libXmu.i686*" "libXmu-devel.i686*" "libffi*" "libffi.i686*" "libffi-devel.i686*"
+  "zlib*" "zlib.i686*" "zlib-devel.i686*" "xulrunner.i686" "gvim*" "ypbind*" "ypserv*"
+  "filezilla*" "xorg-x11-fonts*" "tmux*" "terminator*" "readline*" "libedit*" "mc*" "meld*"
+  "verilator*" "screen*" "tree*" "vnc*" "tigervnc*" "java" "firefox" "python3" "tbb*"
+  "atop*" "htop*" "ntpd*" "rsh*" "xterm*" "libreoffice*" "lm_sensors*" "cockpit**" "ntp*"
+  "xrdp*" "tcsh*" "libnsl*" "libpng15*" "libmng*" "libtiff*" "libstdc*" "compat-openssl10*" "libdb*" "apr-util*" "motif*" "ntsysv"
+)
+alt_candidates(){
+  local pat="$1"
+  case "$pat" in
+    ntpd* ) echo "ntp chrony" ;;
+    java  ) echo "java-11-openjdk java-1.8.0-openjdk" ;;
+    libXest-devel.i686* ) echo "libXext-devel.i686*" ;;
+    redhat-lsb.i686* ) echo "redhat-lsb redhat-lsb-core" ;;
+    * ) echo "" ;;
+  esac
+}
+for pat in "${EXTRA_PKGS[@]}"; do
+  note "PKG TRY: $pat"
+  if /usr/bin/dnf -q repoquery --installed "$pat" >/dev/null 2>&1; then
+    note "PKG OK(installed): $pat"
+    continue
+  fi
+  if /usr/bin/dnf -y install "$pat" \
+       --enablerepo=epel --setopt=powertools.enabled=1 \
+       --setopt=best=False --skip-broken >/dev/null 2>&1; then
+    note "PKG OK: $pat"
+    continue
+  fi
+  alts=( $(alt_candidates "$pat") )
+  if (( ${#alts[@]} > 0 )); then
+    for alt in "${alts[@]}"; do
+      if /usr/bin/dnf -y install "$alt" \
+           --enablerepo=epel --setopt=powertools.enabled=1 \
+           --setopt=best=False --skip-broken >/dev/null 2>&1; then
+        note "PKG OK(alt:${alt}): $pat"
+        break
+      fi
+    done
+  fi
+done
+
+# ── 요약 & 실패표
+sec "SUMMARY"
+{
+  /bin/echo "항목 | 실제값 | 결과"; /bin/echo "---- | ------ | ----"
+  sel=$(/usr/sbin/sestatus 2>/dev/null | /usr/bin/awk -F: '/^SELinux status/{gsub(/^[ \t]+/,"",$2);print $2}')
+  /usr/bin/printf "SELinux|%s|%s\n" "${sel:-unknown}" "$([ "${sel:-}" = disabled ] && /bin/echo OK || /bin/echo CHECK)"
+  en=$(/usr/bin/systemctl show -p UnitFileState firewalld 2>/dev/null | /usr/bin/awk -F= 'NR==1{print $2}')
+  ac=$(/usr/bin/systemctl show -p ActiveState   firewalld 2>/dev/null | /usr/bin/awk -F= 'NR==1{print $2}')
+  /usr/bin/printf "firewalld enabled|%s|%s\n" "${en:-NA}" "$([[ "$en" =~ (disabled|masked) ]] && /bin/echo OK || /bin/echo CHECK)"
+  /usr/bin/printf "firewalld active|%s|%s\n"  "${ac:-NA}" "$([[ "$ac" =~ (inactive|NA) ]] && /bin/echo OK || /bin/echo CHECK)"
+  /usr/bin/printf "/etc/hosts|4 lines|%s\n"  "$([ "$(/usr/bin/wc -l </etc/hosts)" -eq 4 ] && /bin/echo OK || /bin/echo FAIL)"
+  auto=$(/usr/bin/grep -E '^automount:' /etc/nsswitch.conf 2>/dev/null | /usr/bin/head -n1 || /bin/echo none)
+  /usr/bin/printf "nsswitch automount|%s|%s\n" "$auto" "$([[ "$auto" == 'automount:  nis file nis' ]] && /bin/echo OK || /bin/echo FAIL)"
+  zbx=$(/usr/bin/rpm -q zabbix-agent >/dev/null 2>&1 && /bin/echo installed || /bin/echo missing)
+  /usr/bin/printf "zabbix-agent|%s|%s\n" "$zbx" "$([[ "$zbx" = installed ]] && /bin/echo OK || /bin/echo FAIL)"
+  # 크론탭 3줄 확인
+  c_lines=$(/usr/bin/crontab -l 2>/dev/null | /usr/bin/wc -l || /bin/echo 0)
+  /usr/bin/printf "root crontab lines|%s|%s\n" "$c_lines" "$([ "$c_lines" -eq 3 ] && /bin/echo OK || /bin/echo FAIL)"
+} | /usr/bin/tee "$SUM"
+
+if [ ${#fails[@]} -gt 0 ]; then
+  { /bin/echo; /bin/echo "[실패 요약]"; /bin/echo -e "SECTION\tTIME\t\t\tRC\tCOMMAND"; /usr/bin/printf "%s\n" "${fails[@]}" | /usr/bin/column -t -s $'\t'; } | /usr/bin/tee -a "$LOG" | /usr/bin/tee -a "$SUM"
+fi
+/bin/printf "[%s] 완료. 요약: %s, 로그: %s\n" "$(ts)" "$SUM" "$LOG"
